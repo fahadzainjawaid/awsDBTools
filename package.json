@@ -1,0 +1,33 @@
+{
+  "name": "aws-db-tools",
+  "version": "1.0.0",
+  "description": "Command-line tools for fast and repeated AWS Database Related Operations",
+  "private": false,
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "awsDbCopy": "./dist/awsDbCopy.cjs"
+  },
+  "scripts": {
+    "test": "node test/test.js",
+    "compile": "node build.js && chmod +x ./dist/*.cjs",
+    "setup": "npm run compile && npm link"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fahadzainjawaid/awsDBTools.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "GPL-3.0",
+  "bugs": {
+    "url": "https://github.com/fahadzainjawaid/awsDBTools/issues"
+  },
+  "homepage": "https://github.com/fahadzainjawaid/awsDBTools#readme",
+  "dependencies": {
+    "zx": "^8.8.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}
