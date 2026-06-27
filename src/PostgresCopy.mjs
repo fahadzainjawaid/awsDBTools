@@ -4,53 +4,47 @@ import os from "os";
 import path from "path";
 
 const OPTION_KEYS = {
-  "source-host": "sourceHost",
-  "source-port": "sourcePort",
-  "source-user": "sourceUser",
-  "source-password": "sourcePassword",
-  "source-db": "sourceDatabase",
-  "destination-host": "destinationHost",
-  "destination-port": "destinationPort",
-  "destination-user": "destinationUser",
-  "destination-password": "destinationPassword",
-  "destination-db": "destinationDatabase",
-  "dest-host": "destinationHost",
-  "dest-port": "destinationPort",
-  "dest-user": "destinationUser",
-  "dest-password": "destinationPassword",
-  "dest-db": "destinationDatabase",
+  source: "source",
+  src: "source",
+  destination: "destination",
+  dest: "destination",
+  region: "region",
 };
 
-const REQUIRED_OPTIONS = [
-  "sourceHost",
-  "sourceUser",
-  "sourcePassword",
-  "sourceDatabase",
-  "destinationHost",
-  "destinationUser",
-  "destinationPassword",
-  "destinationDatabase",
-];
-
-export function formatUsage() {
+export function formatPostgresCopyUsage() {
   return `Usage:
-  awsDbCopy --source-host <host> --source-user <user> --source-password <password> --source-db <database> \\
-            --destination-host <host> --destination-user <user> --destination-password <password> --destination-db <database> \\
-            [--source-port <port>] [--destination-port <port>]
+  awsDBTools postgresCopy --source <source-secret> --destination <destination-secret> [--region <region>] [--yes]
+
+Options:
+  --source, --src         AWS Secrets Manager secret id/ARN for the SOURCE database.
+  --destination, --dest   AWS Secrets Manager secret id/ARN for the DESTINATION database.
+  --region                AWS region used for all AWS CLI calls (default: ca-central-1).
+  --yes, -y               Skip the confirmation prompt and recreate the destination if it exists.
+  --help, -h              Show this help.
+
+Each secret must contain the following JSON keys:
+  DB_HOSTNAME, DB_USER, DB_PORT, DB_NAME, DB_PASS
 
 Notes:
-  - The destination database must already exist.
-  - pg_dump and pg_restore must be available on your PATH.`;
+  - Requires the AWS CLI installed and authenticated (aws sts get-caller-identity).
+  - Requires pg_dump, pg_restore, and psql on your PATH.
+  - If the destination database already exists you will be asked to delete it
+    so a fresh copy can be taken.`;
 }
 
-export function parseArgs(argv) {
-  const options = {};
+export function parsePostgresCopyArgs(argv) {
+  const options = { assumeYes: false };
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
 
     if (arg === "--help" || arg === "-h") {
       return { help: true };
+    }
+
+    if (arg === "--yes" || arg === "-y") {
+      options.assumeYes = true;
+      continue;
     }
 
     if (!arg.startsWith("--")) {
@@ -75,43 +69,33 @@ export function parseArgs(argv) {
     }
   }
 
-  return normalizeOptions(options);
-}
-
-export function normalizeOptions(options) {
-  const normalized = {
-    ...options,
-    sourcePort: options.sourcePort || "5432",
-    destinationPort: options.destinationPort || "5432",
-  };
-
-  const missingOptions = REQUIRED_OPTIONS.filter((key) => !normalized[key]);
-  if (missingOptions.length > 0) {
-    throw new Error(`Missing required options: ${missingOptions.join(", ")}`);
+  const missing = ["source", "destination"].filter((key) => !options[key]);
+  if (missing.length > 0) {
+    throw new Error(`Missing required options: ${missing.map((key) => `--${key}`).join(", ")}`);
   }
 
-  return normalized;
+  return options;
 }
 
-export function buildPgDumpArgs(options, dumpFile) {
+export function buildPgDumpArgs(source, dumpFile) {
   return [
     "--format=custom",
     "--no-owner",
     "--no-acl",
     "--host",
-    options.sourceHost,
+    source.host,
     "--port",
-    options.sourcePort,
+    source.port,
     "--username",
-    options.sourceUser,
+    source.user,
     "--dbname",
-    options.sourceDatabase,
+    source.database,
     "--file",
     dumpFile,
   ];
 }
 
-export function buildPgRestoreArgs(options, dumpFile) {
+export function buildPgRestoreArgs(destination, dumpFile) {
   return [
     "--clean",
     "--if-exists",
@@ -119,38 +103,109 @@ export function buildPgRestoreArgs(options, dumpFile) {
     "--no-owner",
     "--no-acl",
     "--host",
-    options.destinationHost,
+    destination.host,
     "--port",
-    options.destinationPort,
+    destination.port,
     "--username",
-    options.destinationUser,
+    destination.user,
     "--dbname",
-    options.destinationDatabase,
+    destination.database,
     dumpFile,
   ];
 }
 
-export async function copyDatabase(options, runner = $) {
-  const normalized = normalizeOptions(options);
+function maintenancePsql(destination, runner, command, extraFlags = []) {
+  return runner({
+    env: { ...process.env, PGPASSWORD: destination.password },
+    quiet: true,
+  })`psql --host ${destination.host} --port ${destination.port} --username ${destination.user} --dbname postgres --no-psqlrc ${extraFlags} --command ${command}`;
+}
+
+export async function destinationDatabaseExists(destination, runner = $) {
+  const result = await maintenancePsql(
+    destination,
+    runner,
+    `SELECT 1 FROM pg_database WHERE datname = '${destination.database}'`,
+    ["--tuples-only", "--no-align"],
+  );
+  return result.stdout.trim() === "1";
+}
+
+export async function recreateDestinationDatabase(destination, runner = $) {
+  // Drop any lingering connections so DROP DATABASE can succeed.
+  await maintenancePsql(
+    destination,
+    runner,
+    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${destination.database}' AND pid <> pg_backend_pid()`,
+    ["--tuples-only", "--no-align"],
+  );
+  await maintenancePsql(destination, runner, `DROP DATABASE IF EXISTS "${destination.database}"`);
+  await maintenancePsql(destination, runner, `CREATE DATABASE "${destination.database}"`);
+}
+
+export async function createDestinationDatabase(destination, runner = $) {
+  await maintenancePsql(destination, runner, `CREATE DATABASE "${destination.database}"`);
+}
+
+export async function dumpSource(source, dumpFile, runner = $) {
+  await runner({
+    env: { ...process.env, PGPASSWORD: source.password },
+    stdio: "inherit",
+  })`pg_dump ${buildPgDumpArgs(source, dumpFile)}`;
+}
+
+export async function restoreDestination(destination, dumpFile, runner = $) {
+  await runner({
+    env: { ...process.env, PGPASSWORD: destination.password },
+    stdio: "inherit",
+  })`pg_restore ${buildPgRestoreArgs(destination, dumpFile)}`;
+}
+
+export async function copyDatabase(options, deps = {}) {
+  const {
+    runner = $,
+    promptConfirm = async () => false,
+    checkExists = destinationDatabaseExists,
+    recreate = recreateDestinationDatabase,
+    create = createDestinationDatabase,
+    dump = dumpSource,
+    restore = restoreDestination,
+  } = deps;
+
+  const { source, destination } = options;
+  const assumeYes = options.assumeYes ?? false;
+
+  console.log(
+    `🔎 Checking destination database "${destination.database}" on ${destination.host}:${destination.port}...`,
+  );
+  const exists = await checkExists(destination, runner);
+
+  if (exists) {
+    const confirmed = assumeYes || (await promptConfirm(destination));
+    if (!confirmed) {
+      throw new Error(
+        `Destination database "${destination.database}" already exists. ` +
+          "Delete it (or re-run with --yes) to take a fresh copy.",
+      );
+    }
+    console.log(`🗑️  Dropping and recreating "${destination.database}" for a fresh copy...`);
+    await recreate(destination, runner);
+  } else {
+    console.log(`🆕 Creating destination database "${destination.database}"...`);
+    await create(destination, runner);
+  }
+
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "aws-db-tools-"));
-  const dumpFile = path.join(tempDirectory, `${normalized.sourceDatabase}.dump`);
+  const dumpFile = path.join(tempDirectory, `${source.database}.dump`);
 
   try {
-    console.log(
-      `📥 Dumping ${normalized.sourceDatabase} from ${normalized.sourceHost}:${normalized.sourcePort}...`,
-    );
-    await runner({
-      env: { ...process.env, PGPASSWORD: normalized.sourcePassword },
-      stdio: "inherit",
-    })`pg_dump ${buildPgDumpArgs(normalized, dumpFile)}`;
+    console.log(`📥 Dumping ${source.database} from ${source.host}:${source.port}...`);
+    await dump(source, dumpFile, runner);
 
     console.log(
-      `📤 Restoring into ${normalized.destinationDatabase} on ${normalized.destinationHost}:${normalized.destinationPort}...`,
+      `📤 Restoring into ${destination.database} on ${destination.host}:${destination.port}...`,
     );
-    await runner({
-      env: { ...process.env, PGPASSWORD: normalized.destinationPassword },
-      stdio: "inherit",
-    })`pg_restore ${buildPgRestoreArgs(normalized, dumpFile)}`;
+    await restore(destination, dumpFile, runner);
 
     console.log("✅ Database copy complete.");
   } finally {
